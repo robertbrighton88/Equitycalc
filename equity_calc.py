@@ -269,6 +269,91 @@ def model_multi_round(
 # FORMATTING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# TOKENOMICS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_vesting_schedule(
+    allocations: list,
+    total_supply: int,
+    n_months: int = 60,
+) -> pd.DataFrame:
+    """
+    Build a month-by-month CUMULATIVE token unlock schedule.
+
+    Parameters
+    ──────────
+    allocations   List of dicts with keys:
+                    name      str   – stakeholder label
+                    pct       float – % of total supply (0–100)
+                    tge_pct   float – % of that allocation unlocked at TGE (0–100)
+                    cliff     int   – months before linear vesting starts
+                    vest      int   – months over which remaining tokens vest linearly
+    total_supply  Total token supply (integer)
+    n_months      Number of months to model; month 0 = TGE
+
+    Returns
+    ───────
+    DataFrame with columns: Month | <stakeholder name> …
+    Values are cumulative tokens unlocked (not monthly delta).
+    """
+    months = list(range(n_months + 1))
+    data: dict = {"Month": months}
+
+    for alloc in allocations:
+        tokens      = total_supply * alloc["pct"] / 100.0
+        tge_tokens  = tokens * alloc["tge_pct"] / 100.0
+        remaining   = tokens - tge_tokens
+        cliff       = int(alloc.get("cliff", 0))
+        vest        = int(alloc.get("vest", 0))
+        monthly_vest = remaining / vest if vest > 0 else 0.0
+
+        cumulative = []
+        for m in months:
+            if m == 0 or m <= cliff or vest == 0:
+                unlocked = tge_tokens
+            else:
+                months_vested = min(m - cliff, vest)
+                unlocked = tge_tokens + months_vested * monthly_vest
+            cumulative.append(round(unlocked))
+
+        data[alloc["name"]] = cumulative
+
+    return pd.DataFrame(data)
+
+
+def token_metrics(
+    allocations: list,
+    total_supply: int,
+    token_price: float,
+) -> dict:
+    """
+    Compute key token metrics at TGE (Token Generation Event).
+
+    Returns dict with:
+        fdv, initial_circ_supply, initial_circ_pct, initial_market_cap, token_price
+    """
+    initial_circ = sum(
+        total_supply * a["pct"] / 100.0 * a["tge_pct"] / 100.0
+        for a in allocations
+    )
+    fdv              = total_supply * token_price
+    initial_market_cap = initial_circ * token_price
+
+    return {
+        "fdv":                round(fdv),
+        "total_supply":       total_supply,
+        "initial_circ_supply": round(initial_circ),
+        "initial_circ_pct":   round(initial_circ / total_supply * 100, 2) if total_supply > 0 else 0.0,
+        "initial_market_cap": round(initial_market_cap),
+        "token_price":        token_price,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMATTING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 def fmt_currency(value: float, compact: bool = False) -> str:
     """Format a dollar amount, optionally in compact form (1.5M, 500K)."""
     if compact:

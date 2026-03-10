@@ -17,6 +17,8 @@ from equity_calc import (
     model_round,
     build_comparison_df,
     model_multi_round,
+    build_vesting_schedule,
+    token_metrics,
     fmt_currency,
     fmt_pct,
 )
@@ -113,6 +115,23 @@ def _init_state() -> None:
                 "pool_pct":   3,
             },
         ]
+
+    # Tokenomics defaults – standard Web3 allocation structure
+    if "token_name" not in st.session_state:
+        st.session_state.token_name    = "MyToken"
+        st.session_state.token_ticker  = "MYT"
+        st.session_state.token_supply  = 1_000_000_000
+        st.session_state.token_price   = 0.05   # price at TGE in USD
+
+    if "token_allocations" not in st.session_state:
+        st.session_state.token_allocations = pd.DataFrame([
+            {"Stakeholder": "Team",         "Allocation %": 20, "TGE Unlock %":   0, "Cliff (months)": 12, "Vest (months)": 36},
+            {"Stakeholder": "Investors",    "Allocation %": 15, "TGE Unlock %":   0, "Cliff (months)":  6, "Vest (months)": 24},
+            {"Stakeholder": "Ecosystem",    "Allocation %": 30, "TGE Unlock %":   5, "Cliff (months)":  0, "Vest (months)": 48},
+            {"Stakeholder": "Treasury",     "Allocation %": 20, "TGE Unlock %":   0, "Cliff (months)":  0, "Vest (months)":  0},
+            {"Stakeholder": "Public Sale",  "Allocation %": 10, "TGE Unlock %": 100, "Cliff (months)":  0, "Vest (months)":  0},
+            {"Stakeholder": "Advisors",     "Allocation %":  5, "TGE Unlock %":   0, "Cliff (months)":  6, "Vest (months)": 24},
+        ])
 
 
 _init_state()
@@ -226,11 +245,12 @@ st.caption(
     "and visualise how founder ownership evolves over time."
 )
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📋 Current Cap Table",
     "🎯 Scenario Builder",
     "📊 Scenario Comparison",
     "🔄 Multi-Round Dilution",
+    "🪙 Tokenomics",
     "📖 Manual",
 ])
 
@@ -613,10 +633,186 @@ with tab4:
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 5 – MANUAL
+# TAB 5 – TOKENOMICS
 # ─────────────────────────────────────────────────────────────────────────────
 
 with tab5:
+    st.subheader("🪙 Token Distribution & Vesting")
+    st.caption(
+        "Model your token supply, allocation across stakeholders, "
+        "and how tokens unlock over time after the Token Generation Event (TGE)."
+    )
+
+    # ── Token basics ──────────────────────────────────────────────────────────
+    st.markdown("#### Token Basics")
+    tb1, tb2, tb3, tb4 = st.columns(4)
+    with tb1:
+        st.session_state.token_name = st.text_input(
+            "Token Name", value=st.session_state.token_name, key="tok_name"
+        )
+    with tb2:
+        st.session_state.token_ticker = st.text_input(
+            "Ticker", value=st.session_state.token_ticker, key="tok_ticker"
+        )
+    with tb3:
+        st.session_state.token_supply = st.number_input(
+            "Total Supply",
+            min_value=1_000,
+            max_value=1_000_000_000_000,
+            value=int(st.session_state.token_supply),
+            step=100_000_000,
+            format="%d",
+            key="tok_supply",
+        )
+    with tb4:
+        st.session_state.token_price = st.number_input(
+            "TGE Token Price (USD)",
+            min_value=0.000001,
+            max_value=100_000.0,
+            value=float(st.session_state.token_price),
+            step=0.01,
+            format="%.4f",
+            key="tok_price",
+        )
+
+    st.divider()
+
+    # ── Allocation table ──────────────────────────────────────────────────────
+    st.markdown("#### Allocation Table")
+    st.caption(
+        "Each row is a stakeholder group. "
+        "**Allocation %** must sum to 100. "
+        "**TGE Unlock %** = how much of that group's tokens unlock immediately at TGE. "
+        "Remaining tokens vest linearly after the cliff."
+    )
+
+    edited_alloc = st.data_editor(
+        st.session_state.token_allocations,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "Stakeholder":     st.column_config.TextColumn("Stakeholder", width="medium"),
+            "Allocation %":    st.column_config.NumberColumn("Allocation %",   min_value=0, max_value=100, format="%d %%"),
+            "TGE Unlock %":    st.column_config.NumberColumn("TGE Unlock %",   min_value=0, max_value=100, format="%d %%"),
+            "Cliff (months)":  st.column_config.NumberColumn("Cliff (months)", min_value=0, max_value=60,  format="%d"),
+            "Vest (months)":   st.column_config.NumberColumn("Vest (months)",  min_value=0, max_value=120, format="%d"),
+        },
+        key="tok_alloc_editor",
+    )
+    st.session_state.token_allocations = edited_alloc.dropna(subset=["Stakeholder"]).reset_index(drop=True)
+
+    # Validate total %
+    total_alloc_pct = st.session_state.token_allocations["Allocation %"].sum()
+    if abs(total_alloc_pct - 100) > 0.01:
+        st.warning(f"Allocation % sums to **{total_alloc_pct:.1f}%** — should be 100%.")
+    else:
+        st.success("Allocation % sums to 100% ✓")
+
+    st.divider()
+
+    # ── Build allocations list for calc functions ─────────────────────────────
+    alloc_df = st.session_state.token_allocations
+    allocations = [
+        {
+            "name":    row["Stakeholder"],
+            "pct":     row["Allocation %"],
+            "tge_pct": row["TGE Unlock %"],
+            "cliff":   int(row["Cliff (months)"]),
+            "vest":    int(row["Vest (months)"]),
+        }
+        for _, row in alloc_df.iterrows()
+    ]
+
+    tok_supply = int(st.session_state.token_supply)
+    tok_price  = float(st.session_state.token_price)
+    tok_ticker = st.session_state.token_ticker
+
+    try:
+        tm = token_metrics(allocations, tok_supply, tok_price)
+
+        # ── Key metrics row ───────────────────────────────────────────────────
+        st.markdown("#### Key Metrics at TGE")
+        km1, km2, km3, km4 = st.columns(4)
+        km1.metric("Fully Diluted Valuation",    fmt_currency(tm["fdv"], compact=True))
+        km2.metric("Initial Market Cap",         fmt_currency(tm["initial_market_cap"], compact=True))
+        km3.metric("Initial Circulating Supply", f"{tm['initial_circ_supply']:,} {tok_ticker}")
+        km4.metric("Circ. Supply at TGE",        fmt_pct(tm["initial_circ_pct"]))
+
+        st.divider()
+
+        # ── Charts ────────────────────────────────────────────────────────────
+        col_pie, col_vest = st.columns([1, 2], gap="large")
+
+        with col_pie:
+            st.markdown("#### Token Distribution")
+            fig_tok_pie = px.pie(
+                alloc_df,
+                values="Allocation %",
+                names="Stakeholder",
+                color_discrete_sequence=COLOUR_SEQ,
+                hole=0.4,
+            )
+            fig_tok_pie.update_traces(textposition="inside", textinfo="percent+label")
+            fig_tok_pie.update_layout(
+                showlegend=False,
+                margin=dict(t=10, b=10, l=10, r=10),
+            )
+            st.plotly_chart(fig_tok_pie, use_container_width=True)
+
+        with col_vest:
+            st.markdown("#### Cumulative Token Unlock Schedule")
+            n_months = st.slider(
+                "Months to model", min_value=12, max_value=120,
+                value=60, step=6, key="tok_months"
+            )
+            vest_df = build_vesting_schedule(allocations, tok_supply, n_months)
+
+            # Melt for stacked area chart
+            vest_melted = vest_df.melt(
+                id_vars="Month", var_name="Stakeholder", value_name="Tokens Unlocked"
+            )
+            fig_vest = px.area(
+                vest_melted,
+                x="Month",
+                y="Tokens Unlocked",
+                color="Stakeholder",
+                color_discrete_sequence=COLOUR_SEQ,
+                groupnorm="",   # absolute values, not normalised
+            )
+            fig_vest.update_layout(
+                xaxis_title="Months after TGE",
+                yaxis_title="Cumulative Tokens Unlocked",
+                legend_title_text="Stakeholder",
+                hovermode="x unified",
+            )
+            fig_vest.update_yaxes(tickformat=".2s")
+            st.plotly_chart(fig_vest, use_container_width=True)
+
+        # ── Unlock schedule table (collapsed by default) ──────────────────────
+        with st.expander("View full unlock schedule table"):
+            display_vest = vest_df.copy()
+            # Format large numbers with commas
+            for col in display_vest.columns[1:]:
+                display_vest[col] = display_vest[col].apply(lambda v: f"{int(v):,}")
+            st.dataframe(display_vest, use_container_width=True, hide_index=True)
+
+        # ── Export ────────────────────────────────────────────────────────────
+        st.download_button(
+            "⬇ Download Vesting Schedule CSV",
+            data=vest_df.to_csv(index=False).encode(),
+            file_name=f"{tok_ticker.lower()}_vesting_schedule.csv",
+            mime="text/csv",
+        )
+
+    except Exception as e:
+        st.error(f"Error computing token metrics: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 6 – MANUAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+with tab6:
     st.markdown("""
 ## 📖 User Manual
 
